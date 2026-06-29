@@ -14,6 +14,8 @@ import com.tp.jpa.repository.ProductoRepository;
 import com.tp.jpa.repository.UsuarioRepository;
 import com.tp.jpa.util.JPAUtil;
 
+import jakarta.persistence.EntityManager;
+
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -320,6 +322,11 @@ public class Main {
 
         Producto producto = new Producto(nombre, precio, descripcion, stock, imagen, true);
         Producto guardado = productoRepo.guardar(producto);
+
+        // Associate product with the selected category (unidirectional @OneToMany)
+        catOpt.get().getProductos().add(guardado);
+        categoriaRepo.guardar(catOpt.get());
+
         System.out.println("✔ Producto creado. ID: " + guardado.getId()
                          + " | Categoría: " + catOpt.get().getNombre());
     }
@@ -621,75 +628,29 @@ public class Main {
     private static void crearPedido() {
         System.out.println("\n> Crear Pedido");
 
-        Map<Long, String> prodCats = buildProductoCategoriaMap();
-        List<Producto> productos = productoRepo.listarActivos();
-        if (productos.isEmpty()) {
-            System.out.println("✘ No hay productos disponibles.");
+        // 1. Select user
+        List<Usuario> usuarios = usuarioRepo.listarActivos();
+        if (usuarios.isEmpty()) {
+            System.out.println("✘ No hay usuarios activos.");
             return;
         }
-
-        System.out.println("\nProductos disponibles:");
-        System.out.println("  ID  | Nombre              | Precio     | Categoría");
-        System.out.println("  ────┼─────────────────────┼────────────┼────────────────");
-        for (Producto p : productos) {
-            String cat = prodCats.getOrDefault(p.getId(), "—");
-            System.out.printf("  %-4d| %-21s| $%-9.2f| %s%n",
-                    p.getId(), p.getNombre(), p.getPrecio(), cat);
-        }
-
-        Pedido pedido = new Pedido(LocalDate.now(), Estado.PENDIENTE, FormaPago.EFECTIVO);
-
-        boolean agregar = true;
-        while (agregar) {
-            System.out.print("\nID del producto (0 para cancelar): ");
-            Long prodId = leerLong();
-            if (prodId == null || prodId == 0) {
-                if (pedido.getDetalles().isEmpty()) {
-                    System.out.println("✘ Pedido cancelado.");
-                    return;
-                }
-                break;
-            }
-
-            Optional<Producto> opt = productoRepo.buscarPorId(prodId);
-            if (opt.isEmpty() || opt.get().isEliminado()) {
-                System.out.println("✘ Producto no encontrado.");
-                continue;
-            }
-
-            Producto prod = opt.get();
-            System.out.print("Cantidad: ");
-            int cantidad = leerInt();
-            if (cantidad <= 0) {
-                System.out.println("✘ Cantidad inválida.");
-                continue;
-            }
-
-            pedido.addDetallePedido(cantidad, prod);
-            System.out.println("✔ Agregado: " + prod.getNombre() + " x" + cantidad + " = $" + (cantidad * prod.getPrecio()));
-
-            System.out.print("¿Agregar otro producto? (s/n): ");
-            agregar = scanner.nextLine().trim().toLowerCase().equals("s");
-        }
-
-        // Show summary
-        System.out.println("\n── Resumen del pedido ─────────");
-        double total = 0;
-        for (DetallePedido d : pedido.getDetalles()) {
-            System.out.printf("  %-21s x%d  $%.2f%n",
-                    d.getProducto().getNombre(), d.getCantidad(), d.getSubtotal());
-            total += d.getSubtotal();
-        }
-        System.out.printf("  Total: $%.2f%n", total);
-
-        System.out.print("¿Confirmar pedido? (s/n): ");
-        if (!scanner.nextLine().trim().toLowerCase().equals("s")) {
-            System.out.println("✘ Pedido cancelado.");
+        System.out.println("\nUsuarios disponibles:");
+        listarUsuarios();
+        System.out.print("ID del usuario: ");
+        Long usuarioId = leerLong();
+        if (usuarioId == null) {
+            System.out.println("✘ ID inválido.");
             return;
         }
+        Optional<Usuario> usuarioOpt = usuarioRepo.buscarPorId(usuarioId);
+        if (usuarioOpt.isEmpty() || usuarioOpt.get().isEliminado()) {
+            System.out.println("✘ Usuario no encontrado.");
+            return;
+        }
+        Usuario usuarioSeleccionado = usuarioOpt.get();
 
-        // Select payment method
-        System.out.println("\nFormas de pago:");
+        // 2. Select payment method
+        System.out.println("\nForma de pago:");
         System.out.println("  1. EFECTIVO");
         System.out.println("  2. TARJETA");
         System.out.println("  3. TRANSFERENCIA");
@@ -705,23 +666,130 @@ public class Main {
             }
         }
 
-        pedido.setFormaPago(formaPago);
-        pedido.calcularTotal();
-
-        Pedido guardado = pedidoRepo.guardar(pedido);
-
-        // Reduce stock for each product
-        for (DetallePedido d : pedido.getDetalles()) {
-            Producto prod = d.getProducto();
-            prod.setStock(prod.getStock() - d.getCantidad());
-            productoRepo.guardar(prod);
+        // 3. COLLECTION PHASE (no transaction)
+        Map<Long, String> prodCats = buildProductoCategoriaMap();
+        List<Producto> productos = productoRepo.listarActivos();
+        if (productos.isEmpty()) {
+            System.out.println("✘ No hay productos disponibles.");
+            return;
         }
 
-        // Associate with current user (unidirectional: Usuario -> pedidos)
-        usuarioActual.getPedidos().add(guardado);
-        usuarioRepo.guardar(usuarioActual);
+        System.out.println("\nProductos disponibles:");
+        System.out.println("  ID  | Nombre              | Precio     | Stock | Categoría");
+        System.out.println("  ────┼─────────────────────┼────────────┼───────┼────────────────");
+        for (Producto p : productos) {
+            String cat = prodCats.getOrDefault(p.getId(), "—");
+            System.out.printf("  %-4d| %-21s| $%-9.2f| %-5d | %s%n",
+                    p.getId(), p.getNombre(), p.getPrecio(), p.getStock(), cat);
+        }
 
-        System.out.println("✔ Pedido #" + guardado.getId() + " creado correctamente.");
+        record ItemTemporal(Long idProducto, int cantidad, String nombre, double precio) {}
+        List<ItemTemporal> items = new ArrayList<>();
+
+        String seguir = "s";
+        while (seguir.equals("s")) {
+            System.out.print("\nID del producto (0 para finalizar): ");
+            Long prodId = leerLong();
+            if (prodId == null || prodId == 0) {
+                break;
+            }
+
+            Optional<Producto> opt = productoRepo.buscarPorId(prodId);
+            if (opt.isEmpty() || opt.get().isEliminado()) {
+                System.out.println("✘ Producto no encontrado.");
+                continue;
+            }
+
+            Producto prod = opt.get();
+
+            if (Boolean.FALSE.equals(prod.getDisponible())) {
+                System.out.println("✘ El producto no está disponible.");
+                continue;
+            }
+
+            System.out.print("Cantidad: ");
+            int cantidad = leerInt();
+            if (cantidad <= 0) {
+                System.out.println("✘ Cantidad inválida.");
+                continue;
+            }
+
+            if (prod.getStock() < cantidad) {
+                System.out.println("✘ Stock insuficiente. Disponible: " + prod.getStock());
+                continue;
+            }
+
+            items.add(new ItemTemporal(prodId, cantidad, prod.getNombre(), prod.getPrecio()));
+            System.out.println("✔ Agregado: " + prod.getNombre() + " x" + cantidad
+                    + " = $" + (cantidad * prod.getPrecio()));
+
+            System.out.print("¿Agregar otro producto? (s/n): ");
+            seguir = scanner.nextLine().trim().toLowerCase();
+        }
+
+        if (items.isEmpty()) {
+            System.out.println("✘ Pedido cancelado. No se agregó ningún producto.");
+            return;
+        }
+
+        System.out.print("¿Confirmar pedido? (s/n): ");
+        if (!scanner.nextLine().trim().toLowerCase().equals("s")) {
+            System.out.println("✘ Pedido cancelado.");
+            return;
+        }
+
+        // 4. TRANSACTION PHASE (single EntityManager)
+        EntityManager em = JPAUtil.getEntityManagerFactory().createEntityManager();
+        try {
+            em.getTransaction().begin();
+
+            Pedido pedido = new Pedido(LocalDate.now(), Estado.PENDIENTE, formaPago);
+
+            for (ItemTemporal item : items) {
+                Producto p = em.find(Producto.class, item.idProducto());
+                // Re-validate stock and availability inside the transaction
+                if (p == null || p.isEliminado() || Boolean.FALSE.equals(p.getDisponible())) {
+                    throw new RuntimeException("El producto \"" + item.nombre()
+                            + "\" ya no está disponible.");
+                }
+                if (p.getStock() < item.cantidad()) {
+                    throw new RuntimeException("Stock insuficiente para \""
+                            + item.nombre() + "\". Disponible: " + p.getStock());
+                }
+
+                pedido.addDetallePedido(item.cantidad(), p);
+                p.setStock(p.getStock() - item.cantidad());
+            }
+
+            pedido.calcularTotal();
+            em.persist(pedido);
+
+            Usuario user = em.find(Usuario.class, usuarioSeleccionado.getId());
+            user.getPedidos().add(pedido);
+
+            em.getTransaction().commit();
+
+            // Show summary after successful commit
+            System.out.println("\n── Pedido creado ───────────────");
+            System.out.println("ID: " + pedido.getId());
+            System.out.println("Usuario: " + usuarioSeleccionado.getNombre()
+                    + " " + usuarioSeleccionado.getApellido());
+            System.out.println("Forma de pago: " + formaPago);
+            System.out.println("Productos:");
+            for (DetallePedido d : pedido.getDetalles()) {
+                System.out.printf("  %-21s x%d  $%.2f%n",
+                        d.getProducto().getNombre(), d.getCantidad(), d.getSubtotal());
+            }
+            System.out.printf("Total: $%.2f%n", pedido.getTotal());
+
+        } catch (Exception e) {
+            if (em.getTransaction().isActive()) {
+                em.getTransaction().rollback();
+            }
+            System.out.println("✘ Error al crear el pedido: " + e.getMessage());
+        } finally {
+            em.close();
+        }
     }
 
     private static void cambiarEstadoPedido() {
